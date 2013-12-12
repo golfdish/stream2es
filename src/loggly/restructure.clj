@@ -5,7 +5,9 @@
   (:import [clojure.lang ExceptionInfo]
            [java.util.concurrent CountDownLatch
                                  LinkedBlockingQueue
-                                 TimeUnit]))
+                                 TimeUnit]
+           [java.util PriorityQueue]
+           [com.loggly.indexmanager.db.dao AssignmentDAO IndexDAO))
 
 (defmacro in-thread [thread-name & forms]
   `(.start
@@ -13,10 +15,71 @@
        (fn [] ~@forms)
        ~thread-name)))
 
-(defn get-splitter-policy [opts]
-  ; XXX
-  (fn [cust-id]
-    3))
+(defn get-imdb-index [index-name]
+  (IndexDAO/queryByName index-name))
+
+(defn get-imdb-assignments [imdb-indexes]
+  (when-first [ix imdb-indexes]
+    (concat (AssignmentDAO/queryByIndex (.iid ix))
+            (get-imdb-assignments (rest imdb-indexes)))))
+
+(defn merge-customers [imdb-assns]
+  (loop [assns imdb-assns
+         counts {}
+         merged-assns {}]
+    (when-first [assn assns]
+      (let [cid (.cid assn)
+            cid-count (+ (cid counts 0) (.statsEventCount assn))]
+        (recur
+          (rest assns)
+          (assoc counts cid cid-count)
+          (assoc merged cid {:cid cid :stats-event-count cid-count)))
+      merged)))
+
+(defn add-retentions [assns]
+  (map (fn [assn]
+        {:cid (:cid assn)
+         :stats-event-count (:stats-event-count assn)
+         :retention (get-retention (:cid assn)))
+       assns))
+
+(defn by-retention-events [x y]
+  (let [c (compare (:retention y) (:retention x))]
+    (if (not= c 0)
+      c
+      (let [c (compare (:stats-event-count y) (:stats-event-count x))]
+        c))))
+
+(defn get-src-assns [index-names]
+  (->> index-names
+       (map get-imdb-index)
+       get-imdb-assignments
+       merge-customers
+       add-retentions
+       (sort by-retention-events)))
+
+(defn build-dst-assns [source-index-names target-count]
+  (let [src-assns (get-src-assns source-index-names)]
+    (loop [assns src-assns
+           dst-ixs (apply priority-map (interleave
+                                        (range target-count) (repeat 0)))
+           dst-assns {}]
+      (let [assn (first assns)
+            dst-ix (peek dst-ixs)
+            dst-ix-id (first dst-ix)
+            dst-ix-count (second dst-ix)]
+        (if (empty? assns)
+            dst-assns
+            (recur (rest assns)
+                   (assoc dst-ixs dst-ix-id
+                     (+ dst-ix-count (:stats-event-count assn)))
+                   (assoc dst-assns (:cid assn) dst-ix-id)))))))
+
+; order by (retention, stats_event_count) descending
+(defn get-splitter-policy [{:keys [source-index-names target-count] :as opts]
+  (let [dst-assns (build-dst-assns source-index-names target-count)]
+    (fn [custid]
+      (custid dst-assns))))
 
 (defn do-until-stop [source action]
   (loop []
@@ -98,9 +161,13 @@
   ; XXX
   ["foo" "bar" "baz"])
 
-(defn get-cust [item] 
+(defn get-cust [item]
   ; XXX
   5)
+
+(defn get-index [item]
+  ; XXX
+  "foo")
 
 (defn start-splitter [policy indexers continue? finish]
   (let [q (LinkedBlockingQueue.)
